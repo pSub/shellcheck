@@ -23,7 +23,7 @@ description: |
       # snap connect shellcheck:removable-media
 
 version: git
-base: core18
+base: core24
 grade: stable
 confinement: strict
 
@@ -40,17 +40,18 @@ parts:
     source: .
     build-packages:
       - cabal-install
-      - squid
     override-build: |
-      # See comments in .snapsquid.conf
-      [ "$http_proxy" ] && {
-        squid3 -f .snapsquid.conf
-        export http_proxy="http://localhost:8888"
-        sleep 3
-      }
-      cabal sandbox init
-      cabal update || cat /var/log/squid/*
+      # Give ourselves enough memory to build
+      fallocate -l 2G /tmp/swap
+      chmod 0600 /tmp/swap
+      mkswap /tmp/swap
+      if ! swapon /tmp/swap; then
+        echo "Could not enable swap file, continuing anyway"
+        rm /tmp/swap
+      fi
+
+      cabal update
       cabal install -j
 
-      install -d $SNAPCRAFT_PART_INSTALL/usr/bin
-      install .cabal-sandbox/bin/shellcheck $SNAPCRAFT_PART_INSTALL/usr/bin
+      install -d "${CRAFT_PART_INSTALL}/usr/bin"
+      install --strip ~/.cabal/bin/shellcheck "${CRAFT_PART_INSTALL}/usr/bin"

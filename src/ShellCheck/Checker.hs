@@ -1,5 +1,5 @@
 {-
-    Copyright 2012-2020 Vidar Holen
+    Copyright 2012-2022 Vidar Holen
 
     This file is part of ShellCheck.
     https://www.shellcheck.net
@@ -20,10 +20,13 @@
 {-# LANGUAGE TemplateHaskell #-}
 module ShellCheck.Checker (checkScript, ShellCheck.Checker.runTests) where
 
+import ShellCheck.Analyzer
+import ShellCheck.ASTLib
+import ShellCheck.EditorConfig
 import ShellCheck.Interface
 import ShellCheck.Parser
-import ShellCheck.Analyzer
 
+import Debug.Trace -- DO NOT SUBMIT
 import Data.Either
 import Data.Functor
 import Data.List
@@ -53,7 +56,8 @@ shellFromFilename filename = listToMaybe candidates
     shellExtensions = [(".ksh", Ksh)
                       ,(".bash", Bash)
                       ,(".bats", Bash)
-                      ,(".dash", Dash)]
+                      ,(".dash", Dash)
+                      ,(".envrc", Bash)]
                       -- The `.sh` is too generic to determine the shell:
                       -- We fallback to Bash in this case and emit SC2148 if there is no shebang
     candidates =
@@ -85,7 +89,8 @@ checkScript sys spec = do
                     asCheckSourced = csCheckSourced spec,
                     asExecutionMode = Executed,
                     asTokenPositions = tokenPositions,
-                    asOptionalChecks = csOptionalChecks spec
+                    asExtendedAnalysis = csExtendedAnalysis spec,
+                    asOptionalChecks = getEnableDirectives root ++ csOptionalChecks spec
                 } where as = newAnalysisSpec root
         let analysisMessages =
                 maybe []
@@ -161,6 +166,41 @@ checkWithRcIncludesAndSourcePath rc includes mapper = getErrors
         siFindSource = mapper
     }
 
+-- shellcheck.* directives extracted from an EditorConfig file are merged
+-- into the same "key=value" blob as .shellcheckrc. We simulate that here
+-- by feeding editorConfigDirectives' output through siGetConfig.
+checkWithEditorConfig ec name src =
+    let sys = (mockedSystemInterface [("foo", src)]) {
+            siGetConfig = const . return $
+                Just (".editorconfig", fromMaybe "" $ editorConfigDirectives ec name)
+        }
+    in getErrors sys emptyCheckSpec {
+        csScript = src,
+        csExcludedWarnings = [2148]
+    }
+
+prop_editorConfigAppliesKnownShell =
+    null $ checkWithEditorConfig "[foo]\nshellcheck.shell=bash\n" "foo"
+        "#!/bin/sh\necho \"hi\""
+prop_editorConfigAppliesDisable =
+    null $ checkWithEditorConfig "[foo]\nshellcheck.disable=SC2086\n" "foo"
+        "#!/bin/sh\necho $1"
+prop_editorConfigUnknownShellIsReported =
+    -- An unknown shell can't be applied silently; it surfaces as a
+    -- config parse error (SC1134) rather than being dropped.
+    [1134] == checkWithEditorConfig "[foo]\nshellcheck.shell=zsh\n" "foo"
+        "#!/bin/sh\necho \"hi\""
+prop_editorConfigCommentValueIsReported =
+    -- EditorConfig has no inline comments, so a '#'-prefixed value is
+    -- reported as a config error (SC1134) instead of being eaten.
+    [1134] == checkWithEditorConfig "[foo]\nshellcheck.disable=#abc\n" "foo"
+        "#!/bin/sh\necho \"hi\""
+prop_editorConfigNonMatchingSectionIgnored =
+    -- A directive in a section whose glob does not match the file is
+    -- not applied (and produces no config error).
+    [2086] == checkWithEditorConfig "[bar]\nshellcheck.disable=SC2086\n" "foo"
+        "#!/bin/sh\necho $1"
+
 prop_findsParseIssue = check "echo \"$12\"" == [1037]
 
 prop_commentDisablesParseIssue1 =
@@ -218,6 +258,9 @@ prop_worksWhenSourcing =
 prop_worksWhenSourcingWithDashDash =
     null $ checkWithIncludes [("lib", "bar=1")] "source -- lib; echo \"$bar\""
 
+prop_worksWhenSourcingWithDashP =
+    null $ checkWithIncludes [("lib", "bar=1")] "source -p \"$MYPATH\" lib; echo \"$bar\""
+
 prop_worksWhenDotting =
     null $ checkWithIncludes [("lib", "bar=1")] ". lib; echo \"$bar\""
 
@@ -242,6 +285,9 @@ prop_canStripPrefixAndSource2 =
 
 prop_canSourceDynamicWhenRedirected =
     null $ checkWithIncludes [("lib", "")] "#shellcheck source=lib\n. \"$1\""
+
+prop_canRedirectWithSpaces =
+    null $ checkWithIncludes [("my file", "")] "#shellcheck source=\"my file\"\n. \"$1\""
 
 prop_recursiveAnalysis =
     [2086] == checkRecursive [("lib", "echo $1")] "source lib"
@@ -296,6 +342,13 @@ prop_deducesTypeFromExtension2 = result == [2079]
   where
     result = checkWithSpec [] emptyCheckSpec {
         csFilename = "file.bash",
+        csScript = "(( 3.14 ))"
+    }
+
+prop_deducesTypeFromEnvrcExtension = result == [2079]
+  where
+    result = checkWithSpec [] emptyCheckSpec {
+        csFilename = ".envrc",
         csScript = "(( 3.14 ))"
     }
 
@@ -412,6 +465,15 @@ prop_sourcePathAddsAnnotation = result == [2086]
         csCheckSourced = True
     }
 
+prop_sourcePathWorksWithSpaces = result == [2086]
+  where
+    f "dir/myscript" _ ["my path"] "lib" = return "foo/lib"
+    result = checkWithIncludesAndSourcePath [("foo/lib", "echo $1")] f emptyCheckSpec {
+        csScript = "#!/bin/bash\n# shellcheck source-path='my path'\nsource lib",
+        csFilename = "dir/myscript",
+        csCheckSourced = True
+    }
+
 prop_sourcePathRedirectsDirective = result == [2086]
   where
     f "dir/myscript" _ _ "lib" = return "foo/lib"
@@ -483,6 +545,67 @@ prop_fileCannotEnableExternalSources2 = result == [1144]
         csCheckSourced = True
     }
 
+prop_rcCanSuppressEarlyProblems1 = null result
+  where
+    result = checkWithRc "disable=1071" emptyCheckSpec {
+        csScript = "#!/bin/zsh\necho $1"
+    }
+
+prop_rcCanSuppressEarlyProblems2 = null result
+  where
+    result = checkWithRc "disable=1104" emptyCheckSpec {
+        csScript = "!/bin/bash\necho 'hello world'"
+    }
+
+prop_sourceWithHereDocWorks = null result
+  where
+    result = checkWithIncludes [("bar", "true\n")] "source bar << eof\nlol\neof"
+
+prop_hereDocsAreParsedWithoutTrailingLinefeed = 1044 `elem` result
+  where
+    result = check "cat << eof"
+
+prop_hereDocsWillHaveParsedIndices = null result
+  where
+    result = check "#!/bin/bash\nmy_array=(a b)\ncat <<EOF >> ./test\n $(( 1 + my_array[1] ))\nEOF"
+
+prop_rcCanSuppressDfa = null result
+  where
+    result = checkWithRc "extended-analysis=false" emptyCheckSpec {
+        csScript = "#!/bin/sh\nexit; foo;"
+    }
+
+prop_fileCanSuppressDfa = null $ traceShowId result
+  where
+    result = checkWithRc "" emptyCheckSpec {
+        csScript = "#!/bin/sh\n# shellcheck extended-analysis=false\nexit; foo;"
+    }
+
+prop_fileWinsWhenSuppressingDfa1 = null result
+  where
+    result = checkWithRc "extended-analysis=true" emptyCheckSpec {
+        csScript = "#!/bin/sh\n# shellcheck extended-analysis=false\nexit; foo;"
+    }
+
+prop_fileWinsWhenSuppressingDfa2 = result == [2317]
+  where
+    result = checkWithRc "extended-analysis=false" emptyCheckSpec {
+        csScript = "#!/bin/sh\n# shellcheck extended-analysis=true\nexit; foo;"
+    }
+
+prop_flagWinsWhenSuppressingDfa1 = result == [2317]
+  where
+    result = checkWithRc "extended-analysis=false" emptyCheckSpec {
+        csScript = "#!/bin/sh\n# shellcheck extended-analysis=false\nexit; foo;",
+        csExtendedAnalysis = Just True
+    }
+
+prop_flagWinsWhenSuppressingDfa2 = null result
+  where
+    result = checkWithRc "extended-analysis=true" emptyCheckSpec {
+        csScript = "#!/bin/sh\n# shellcheck extended-analysis=true\nexit; foo;",
+        csExtendedAnalysis = Just False
+    }
 
 return []
 runTests = $quickCheckAll

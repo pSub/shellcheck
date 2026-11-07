@@ -6,7 +6,7 @@ shellcheck - Shell script analysis tool
 
 # SYNOPSIS
 
-**shellcheck** [*OPTIONS*...] *FILES*...
+**shellcheck** [*OPTIONS*...] [--files-from=FILE] *FILES*...
 
 # DESCRIPTION
 
@@ -56,11 +56,22 @@ not warn at all, as `ksh` supports decimals in arithmetic contexts.
     options are cumulative, but all the codes can be specified at once,
     comma-separated as a single argument.
 
+**--extended-analysis=true/false**
+
+:   Enable/disable Dataflow Analysis to identify more issues (default true). If
+    ShellCheck uses too much CPU/RAM when checking scripts with several
+    thousand lines of code, extended analysis can be disabled with this flag
+    or a directive. This flag overrides directives and rc files.
+
 **-f** *FORMAT*, **--format=***FORMAT*
 
 :   Specify the output format of shellcheck, which prints its results in the
     standard output. Subsequent **-f** options are ignored, see **FORMATS**
     below for more information.
+
+**--help**
+
+:   Show a usage summary and exit.
 
 **--list-optional**
 
@@ -69,7 +80,14 @@ not warn at all, as `ksh` supports decimals in arithmetic contexts.
 
 **--norc**
 
-:   Don't try to look for .shellcheckrc configuration files.
+:   Don't try to look for .shellcheckrc or .editorconfig configuration files.
+    This also disables **--rcfile**.
+
+**--rcfile** *RCFILE*
+
+:   Prefer the specified configuration file over searching for one
+    in the default locations. The specified file is not read if
+    **--norc** is also given.
 
 **-o**\ *NAME1*[,*NAME2*...],\ **--enable=***NAME1*[,*NAME2*...]
 
@@ -85,7 +103,8 @@ not warn at all, as `ksh` supports decimals in arithmetic contexts.
 
 **-s**\ *shell*,\ **--shell=***shell*
 
-:   Specify Bourne shell dialect. Valid values are *sh*, *bash*, *dash* and *ksh*.
+:   Specify Bourne shell dialect. Valid values are *sh*, *bash*, *dash*, *ksh*,
+    and *busybox*.
     The default is to deduce the shell from the file's `shell` directive,
     shebang, or `.bash/.bats/.dash/.ksh` extension, in that order. *sh* refers to
     POSIX `sh` (not the system's), and will warn of portability issues.
@@ -103,7 +122,7 @@ not warn at all, as `ksh` supports decimals in arithmetic contexts.
 **-W** *NUM*,\ **--wiki-link-count=NUM**
 
 :   For TTY output, show *NUM* wiki links to more information about mentioned
-    warnings. Set to 0 to disable them entirely.
+    warnings. The default is 3. Set to 0 to disable them entirely.
 
 **-x**,\ **--external-sources**
 
@@ -119,6 +138,12 @@ not warn at all, as `ksh` supports decimals in arithmetic contexts.
 
 :   One or more script files to check, or "-" for standard input.
 
+**--files-from** *FILE*
+
+:   Read a list of files to check from *FILE*. Each line should contain one
+    file path. Lines starting with `#` or empty lines are ignored. Use `-` to
+    read the list from standard input. This option is processed in addition to
+    any files specified on the command line.
 
 # FORMATS
 
@@ -134,7 +159,7 @@ not warn at all, as `ksh` supports decimals in arithmetic contexts.
     For example, in Vim, `:set makeprg=shellcheck\ -f\ gcc\ %` will allow
     using `:make` to check the script, and `:cnext` to jump to the next error.
 
-        <file>:<line>:<column>: <type>: <message>
+        <file>:<line>:<column>: <type>: <message> [SC####]
 
 **checkstyle**
 
@@ -171,7 +196,6 @@ not warn at all, as `ksh` supports decimals in arithmetic contexts.
              && echo -e 'Playlist $f contains a HQ file in mp3 format'
          done
 
-
 **json1**
 
 :   Json is a popular serialization format that is more suitable for web
@@ -201,7 +225,6 @@ not warn at all, as `ksh` supports decimals in arithmetic contexts.
 
 :   Suppress all normal output. Exit with zero if no issues are found,
     otherwise exit with one. Stops processing after the first issue.
-
 
 # DIRECTIVES
 
@@ -236,12 +259,20 @@ Valid keys are:
 :   Disables a comma separated list of error codes for the following command.
     The command can be a simple command like `echo foo`, or a compound command
     like a function definition, subshell block or loop. A range can be
-    be specified with a dash, e.g. `disable=SC3000-SC4000` to exclude 3xxx.
+    specified with a dash, e.g. `disable=SC3000-SC4000` to exclude 3xxx.
+    The end of the range is exclusive: this example covers SC3000 through
+    SC3999, but not SC4000.
     All warnings can be disabled with `disable=all`.
 
 **enable**
 :   Enable an optional check by name, as listed with **--list-optional**.
     Only file-wide `enable` directives are considered.
+
+**extended-analysis**
+:   Set to true/false to enable/disable dataflow analysis. Specifying
+    `# shellcheck extended-analysis=false` in particularly large (2000+ line)
+    auto-generated scripts will reduce ShellCheck's resource usage at the
+    expense of certain checks. Extended analysis is enabled by default.
 
 **external-sources**
 :   Set to `true` in `.shellcheckrc` to always allow ShellCheck to open
@@ -267,7 +298,7 @@ Valid keys are:
 **shell**
 :   Overrides the shell detected from the shebang.  This is useful for
     files meant to be included (and thus lacking a shebang), or possibly
-    as a more targeted alternative to 'disable=SC2039'.
+    as a more targeted alternative to 'disable=SC3000-SC4000'.
 
 # RC FILES
 
@@ -282,6 +313,9 @@ Here is an example `.shellcheckrc`:
     source-path=SCRIPTDIR
     source-path=/mnt/chroot
 
+    # Since 0.9.0, values can be quoted with '' or "" to allow spaces
+    source-path="My Documents/scripts"
+
     # Allow opening any 'source'd file, even if not specified as input
     external-sources=true
 
@@ -295,9 +329,14 @@ Here is an example `.shellcheckrc`:
     disable=SC2236
 
 If no `.shellcheckrc` is found in any of the parent directories, ShellCheck
-will look in `~/.shellcheckrc` followed by the XDG config directory
-(usually `~/.config/shellcheckrc`) on Unix, or `%APPDATA%/shellcheckrc` on
-Windows. Only the first file found will be used.
+checks the following additional paths and uses the first file found:
+
++ On Unix-like systems, checks for `~/.shellcheckrc` followed by
+  `$XDG_CONFIG_HOME/shellcheckrc` (no leading dot). If `$XDG_CONFIG_HOME` is
+  unset it defaults to `~/.config`.
++ On Windows systems, checks for `%APPDATA%\shellcheckrc` followed by
+  `%XDG_CONFIG_HOME%\shellcheckrc`. If `%XDG_CONFIG_HOME%` is unset it defaults
+  to `%APPDATA%`, making this path equal to the previous path and a no-op.
 
 Note for Snap users: the Snap sandbox disallows access to hidden files.
 Use `shellcheckrc` without the dot instead.
@@ -305,6 +344,30 @@ Use `shellcheckrc` without the dot instead.
 Note for Docker users: ShellCheck will only be able to look for files that
 are mounted in the container, so `~/.shellcheckrc` will not be read.
 
+# EDITORCONFIG
+
+Unless `--norc` is used, ShellCheck will also look for a file `.editorconfig`
+in the script's directory and each parent directory. Any section whose glob
+pattern matches the checked file will have its `shellcheck.*` keys read as
+directives, with the `shellcheck.` prefix stripped. This uses the same
+`key=value` syntax as `.shellcheckrc`.
+
+For example:
+
+    [*.{ebuild,eclass}]
+    shellcheck.shell=bash
+    shellcheck.disable=SC2034
+
+    [{PKGBUILD,APKBUILD}]
+    shellcheck.shell=bash
+    shellcheck.disable=SC2034
+
+If no matching directives are found in any `.editorconfig` in the parent
+directories, ShellCheck will look in the global default
+`$XDG_CONFIG_HOME/editorconfig.ini` (usually `~/.config/editorconfig.ini`).
+
+Directives from `.shellcheckrc`/`shellcheckrc` and from `.editorconfig` are
+both applied, with `.shellcheckrc` taking precedence in case of conflicts.
 
 # ENVIRONMENT VARIABLES
 
@@ -375,10 +438,10 @@ long list of wonderful contributors.
 
 # COPYRIGHT
 
-Copyright 2012-2021, Vidar Holen and contributors.
+Copyright 2012-2025, Vidar Holen and contributors.
 Licensed under the GNU General Public License version 3 or later,
 see https://gnu.org/licenses/gpl.html
 
 # SEE ALSO
 
-sh(1) bash(1)
+sh(1), bash(1), dash(1), ksh(1)

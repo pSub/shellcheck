@@ -20,6 +20,7 @@
 import qualified ShellCheck.Analyzer
 import           ShellCheck.Checker
 import           ShellCheck.Data
+import           ShellCheck.EditorConfig
 import           ShellCheck.Interface
 import           ShellCheck.Regex
 
@@ -34,6 +35,8 @@ import qualified ShellCheck.Formatter.Quiet
 
 import           Control.Exception
 import           Control.Monad
+import           Control.Monad.IO.Class
+import           Control.Monad.Trans.Class
 import           Control.Monad.Except
 import           Data.Bits
 import           Data.Char
@@ -74,7 +77,8 @@ data Options = Options {
     externalSources  :: Bool,
     sourcePaths      :: [FilePath],
     formatterOptions :: FormatterOptions,
-    minSeverity      :: Severity
+    minSeverity      :: Severity,
+    rcfile           :: Maybe FilePath
 }
 
 defaultOptions = Options {
@@ -84,7 +88,8 @@ defaultOptions = Options {
     formatterOptions = newFormatterOptions {
         foColorOption = ColorAuto
     },
-    minSeverity = StyleC
+    minSeverity = StyleC,
+    rcfile = Nothing
 }
 
 usageHeader = "Usage: shellcheck [OPTIONS...] FILES..."
@@ -98,13 +103,18 @@ options = [
         (ReqArg (Flag "include") "CODE1,CODE2..") "Consider only given types of warnings",
     Option "e" ["exclude"]
         (ReqArg (Flag "exclude") "CODE1,CODE2..") "Exclude types of warnings",
+    Option "" ["extended-analysis"]
+        (ReqArg (Flag "extended-analysis") "bool") "Perform dataflow analysis (default true)",
     Option "f" ["format"]
         (ReqArg (Flag "format") "FORMAT") $
         "Output format (" ++ formatList ++ ")",
     Option "" ["list-optional"]
         (NoArg $ Flag "list-optional" "true") "List checks disabled by default",
     Option "" ["norc"]
-        (NoArg $ Flag "norc" "true") "Don't look for .shellcheckrc files",
+        (NoArg $ Flag "norc" "true") "Don't look for .shellcheckrc and .editorconfig files",
+    Option "" ["rcfile"]
+        (ReqArg (Flag "rcfile") "RCFILE")
+        "Prefer the specified configuration file over searching for one",
     Option "o" ["enable"]
         (ReqArg (Flag "enable") "check1,check2..")
         "List of optional checks to enable (or 'all')",
@@ -113,7 +123,7 @@ options = [
         "Specify path when looking for sourced files (\"SCRIPTDIR\" for script's dir)",
     Option "s" ["shell"]
         (ReqArg (Flag "shell") "SHELLNAME")
-        "Specify dialect (sh, bash, dash, ksh)",
+        "Specify dialect (sh, bash, dash, ksh, busybox)",
     Option "S" ["severity"]
         (ReqArg (Flag "severity") "SEVERITY")
         "Minimum severity of errors to consider (error, warning, info, style)",
@@ -125,11 +135,27 @@ options = [
     Option "x" ["external-sources"]
         (NoArg $ Flag "externals" "true") "Allow 'source' outside of FILES",
     Option "" ["help"]
-        (NoArg $ Flag "help" "true") "Show this usage summary and exit"
+        (NoArg $ Flag "help" "true") "Show this usage summary and exit",
+    Option "" ["files-from"]
+        (ReqArg (Flag "files-from") "FILE")
+        "Read input files from FILE (one per line, or '-' for stdin)"
     ]
 getUsageInfo = usageInfo usageHeader options
 
 printErr = lift . hPutStrLn stderr
+
+trim :: String -> String
+trim = f . f
+  where f = reverse . dropWhile isSpace
+
+parseFileListLines :: String -> [FilePath]
+parseFileListLines contents =
+    [ line
+    | raw <- lines contents
+    , let line = trim raw
+    , not (null line)
+    , not ("#" `isPrefixOf` line)
+    ]
 
 parseArguments :: [String] -> ExceptT Status IO ([Flag], [FilePath])
 parseArguments argv =
@@ -199,20 +225,45 @@ statusToCode status =
 process :: [Flag] -> [FilePath] -> ExceptT Status IO Status
 process flags files = do
     options <- foldM (flip parseOption) defaultOptions flags
-    verifyFiles files
+
+    let filesFrom = getOptions flags "files-from"
+    extra <- fmap concat $ mapM readFilesFrom filesFrom
+    let allFiles = extra ++ files
+
+    -- It shouldn't be an error to do --files-from=/dev/null
+    when (null filesFrom) $
+        verifyFiles allFiles
+
     let format = fromMaybe "tty" $ getOption flags "format"
     let formatters = formats $ formatterOptions options
-    formatter <-
-        case Map.lookup format formatters of
-            Nothing -> do
-                printErr $ "Unknown format " ++ format
-                printErr "Supported formats:"
-                mapM_ (printErr . write) $ Map.keys formatters
-                throwError SupportFailure
-              where write s = "  " ++ s
-            Just f -> ExceptT $ fmap Right f
-    sys <- lift $ ioInterface options files
-    lift $ runFormatter sys formatter options files
+    formatter <- case Map.lookup format formatters of
+        Nothing -> do
+            printErr $ "Unknown format " ++ format
+            printErr "Supported formats:"
+            mapM_ (printErr . ("  " ++)) $ Map.keys formatters
+            throwError SupportFailure
+        Just f -> ExceptT $ fmap Right f
+
+    sys <- lift $ ioInterface options allFiles
+
+    lift $ runFormatter sys formatter options allFiles
+
+  where
+    readFilesFrom :: FilePath -> ExceptT Status IO [FilePath]
+    readFilesFrom "-" = do
+        contents <- lift getContents
+        return (parseFileListLines contents)
+
+    readFilesFrom path = do
+        result <- liftIO (try (readFile path) :: IO (Either IOException String))
+        case result of
+            Left e -> do
+                printErr $ "Could not read file list: " ++ path ++ ": " ++ show e
+                throwError RuntimeException
+            Right contents ->
+                return (parseFileListLines contents)
+
+
 
 runFormatter :: SystemInterface IO -> Formatter -> Options -> [FilePath]
             -> IO Status
@@ -225,7 +276,7 @@ runFormatter sys format options files = do
     f :: Status -> FilePath -> IO Status
     f status file = do
         newStatus <- process file `catch` handler file
-        return $ status `mappend` newStatus
+        return $! status `mappend` newStatus
     handler :: FilePath -> IOException -> IO Status
     handler file e = reportFailure file (show e)
     reportFailure file str = do
@@ -244,15 +295,24 @@ runFormatter sys format options files = do
             }
             result <- checkScript sys checkspec
             onResult format result sys
+            -- A malformed EditorConfig (invalid 'root' or 'shellcheck.*'
+            -- directive) means shellcheck cannot apply the requested
+            -- configuration, so it fails rather than silently proceeding.
             return $
-                if null (crComments result)
-                then NoProblems
-                else SomeProblems
+                if any editorConfigError (crComments result)
+                    then SupportFailure
+                    else if null (crComments result)
+                        then NoProblems
+                        else SomeProblems
+
+        editorConfigError pc =
+            cCode (pcComment pc) == 1134 &&
+                ".editorconfig" `isSuffixOf` posFile (pcStartPos pc)
 
 parseEnum name value list =
-    case filter ((== value) . fst) list of
-        [(name, value)] -> return value
-        [] -> do
+    case lookup value list of
+        Just value -> return value
+        Nothing -> do
             printErr $ "Unknown value for --" ++ name ++ ". " ++
                        "Valid options are: " ++ (intercalate ", " $ map fst list)
             throwError SupportFailure
@@ -365,6 +425,11 @@ parseOption flag options =
                 }
             }
 
+        Flag "rcfile" str -> do
+            return options {
+                rcfile = Just str
+            }
+
         Flag "enable" value ->
             let cs = checkSpec options in return options {
                 checkSpec = cs {
@@ -372,8 +437,19 @@ parseOption flag options =
                 }
             }
 
+        Flag "extended-analysis" str -> do
+            value <- parseBool str
+            return options {
+                checkSpec = (checkSpec options) {
+                    csExtendedAnalysis = Just value
+                }
+            }
+
         -- This flag is handled specially in 'process'
         Flag "format" _ -> return options
+
+        -- This flag is handled specially in 'process'
+        Flag "files-from" _ -> return options
 
         Flag str _ -> do
             printErr $ "Internal error for --" ++ str ++ ". Please file a bug :("
@@ -389,12 +465,20 @@ parseOption flag options =
             throwError SyntaxFailure
         return (Prelude.read num :: Integer)
 
+    parseBool str = do
+        case str of
+            "true" -> return True
+            "false" -> return False
+            _ -> do
+                printErr $ "Invalid boolean, expected true/false: " ++ str
+                throwError SyntaxFailure
+
 ioInterface :: Options -> [FilePath] -> IO (SystemInterface IO)
 ioInterface options files = do
     inputs <- mapM normalize files
     cache <- newIORef emptyCache
     configCache <- newIORef ("", Nothing)
-    return SystemInterface {
+    return (newSystemInterface :: SystemInterface IO) {
         siReadFile = get cache inputs,
         siFindSource = findSourceFile inputs (sourcePaths options),
         siGetConfig = getConfig configCache
@@ -439,18 +523,114 @@ ioInterface options files = do
         fallback :: FilePath -> IOException -> IO FilePath
         fallback path _ = return path
 
-    -- Returns the name and contents of .shellcheckrc for the given file
+
+    -- Returns the name and contents of .shellcheckrc for the given file,
+    -- merged with any shellcheck.* directives found in applicable
+    -- EditorConfig files.
     getConfig cache filename = do
-        path <- normalize filename
-        let dir = takeDirectory path
-        (previousPath, result) <- readIORef cache
-        if dir == previousPath
-          then return result
-          else do
-            paths <- getConfigPaths dir
-            result <- findConfig paths
-            writeIORef cache (dir, result)
-            return result
+        rcResult <- getRcConfig cache filename
+        ecResult <- getEditorConfig filename
+        return $ mergeConfigs filename rcResult ecResult
+
+    mergeConfigs filename rcResult ecResult =
+        case (rcResult, ecResult) of
+            (Nothing, Nothing) -> Nothing
+            (Just (rcPath, rc), Nothing) -> Just (rcPath, rc)
+            (Nothing, Just (ecPath, ec)) -> Just (ecPath, ec)
+            (Just (rcPath, rc), Just (ecPath, ec)) ->
+                if isEditorConfigRejection ec
+                    then Just (ecPath, ec)
+                    else Just (rcPath, rc ++ "\n" ++ ec)
+
+    isEditorConfigRejection ec =
+        all (\l -> null (trim l) || l == "invalid editorconfig value") (lines ec)
+
+
+    getRcConfig cache filename =
+        case rcfile options of
+            Just file -> do
+                -- We have a specified rcfile. Ignore normal rcfile resolution.
+                (path, result) <- readIORef cache
+                if path == "/"
+                  then return result
+                  else do
+                    result <- readConfig file
+                    when (isNothing result) $
+                        hPutStrLn stderr $ "Warning: unable to read --rcfile " ++ file
+                    writeIORef cache ("/", result)
+                    return result
+
+            Nothing -> do
+                path <- normalize filename
+                let dir = takeDirectory path
+                (previousPath, result) <- readIORef cache
+                if dir == previousPath
+                  then return result
+                  else do
+                    paths <- getConfigPaths dir
+                    result <- findConfig paths
+                    writeIORef cache (dir, result)
+                    return result
+
+    -- Look for .editorconfig files in the target file's directory and
+    -- all its parents (as per the EditorConfig spec), plus the global
+    -- ${XDG_CONFIG_HOME}/editorconfig.ini default. shellcheck.* keys in
+    -- matching sections are turned into directives.
+    getEditorConfig filename = do
+        -- Resolve the directory (to find .editorconfig files) but keep
+        -- the leaf filename as-is so that globs match the symlink name
+        -- rather than the resolved target.
+        let name = takeFileName filename
+        dir <- normalize (takeDirectory filename)
+        let path = dir </> name
+        dirConfigs <- collectDirConfigs dir
+        globalConfig <- readGlobalEditorConfig
+        let allConfigs = dirConfigs ++ globalConfig
+            contributions = concatMap (directivesFor path) allConfigs
+        return $ case contributions of
+            [] -> Nothing
+            ((sourceFile, _):_) -> Just (sourceFile, concatMap snd contributions)
+      where
+        -- For each EditorConfig file: report any invalid 'root'
+        -- declaration (which takes priority) as a rejected config blob,
+        -- otherwise yield the matching shellcheck.* directives
+        -- (invalid directives are reported by editorConfigDirectives as a
+        -- rejected blob so the .shellcheckrc parser emits SC1134).
+        directivesFor path (file, contents) =
+            let relative = makeRelativeTo (takeDirectory file) path
+            in case invalidRootLines contents of
+                (badLine:_) ->
+                    [(file, replicate (badLine - 1) '\n' ++ "invalid editorconfig value\n")]
+                [] ->
+                    case editorConfigDirectives contents relative of
+                        Nothing -> []
+                        Just blob -> [(file, blob)]
+
+        makeRelativeTo dir path =
+            case stripPrefix (addTrailingSlash dir) path of
+                Just rest -> rest
+                Nothing -> takeFileName path
+
+        addTrailingSlash dir
+            | null dir = dir
+            | last dir == '/' = dir
+            | otherwise = dir ++ "/"
+
+        collectDirConfigs dir = do
+            current <- readConfig (dir </> ".editorconfig")
+            let isRoot = maybe False (isEditorConfigRoot . snd) current
+                next = takeDirectory dir
+            rest <- if next /= dir && not isRoot
+                    then collectDirConfigs next
+                    else return []
+            return $ maybeToList current ++ rest
+
+        readGlobalEditorConfig = do
+            path <- (getXdgDirectory XdgConfig "editorconfig.ini")
+                        `catch` ((const $ return "") :: IOException -> IO FilePath)
+            if null path
+              then return []
+              else maybeToList <$> readConfig path
 
     findConfig paths =
         case paths of
@@ -488,7 +668,7 @@ ioInterface options files = do
       where
         handler :: FilePath -> IOException -> IO (String, Bool)
         handler file err = do
-            putStrLn $ file ++ ": " ++ show err
+            hPutStrLn stderr $ file ++ ": " ++ show err
             return ("", True)
 
     andM a b arg = do
@@ -584,6 +764,8 @@ printOptional = do
     list = sortOn cdName ShellCheck.Analyzer.optionalChecks
     f item = do
         putStrLn $ "name:    " ++ cdName item
+        putStrLn $ "id:      " ++ intercalate ", " ["SC" ++ show n | n <- cdId item]
+        putStrLn $ "wiki:    " ++ intercalate ", " [ShellCheck.Formatter.TTY.wikiLink ++ "SC" ++ show n | n <- cdId item]
         putStrLn $ "desc:    " ++ cdDescription item
         putStrLn $ "example: " ++ cdPositive item
         putStrLn $ "fix:     " ++ cdNegative item

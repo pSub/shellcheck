@@ -12,7 +12,9 @@ cabal-dev
 .cabal-sandbox/
 cabal.sandbox.config
 cabal.config
+cabal.project.freeze
 .stack-work
+stack.yaml.lock
 
 ### Snap ###
 /snap/.snapcraft/
@@ -20,3 +22,7 @@ cabal.config
 /parts/
 /prime/
 *.snap
+/dist-newstyle/
+
+### misc ###
+/shellcheck.1
